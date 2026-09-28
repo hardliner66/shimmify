@@ -2,12 +2,15 @@ use std::{
     collections::BTreeMap,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, exit},
+    process::Command,
 };
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[cfg(not(target_family = "unix"))]
+compile_error!("shimmify only supports Unix-like systems");
 
 #[derive(Parser)]
 pub struct ShimmifyArgs {
@@ -41,8 +44,13 @@ pub enum ShimmifyAction {
     /// Removes a shim
     #[command(aliases = ["d", "delete", "rem"])]
     Remove {
-        /// The name of the shim to remove
-        name: String,
+        /// The names of the shims to remove
+        #[arg(required_unless_present="all", conflicts_with="all", num_args=1..)]
+        names: Vec<String>,
+
+        /// Remove all shims
+        #[arg(short, long)]
+        all: bool,
     },
     /// Activates a shim
     #[command(aliases = ["u"])]
@@ -54,10 +62,10 @@ pub enum ShimmifyAction {
     #[command(aliases = ["res", "unset"])]
     Reset,
     /// Runs the configured shim, using execvp
-    #[command(aliases = ["r", "run"])]
+    #[command(aliases = ["r"])]
     Run {
         /// The arguments the shim gets passed
-        #[arg(trailing_var_arg = true)]
+        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Lists all the configured shims
@@ -70,8 +78,12 @@ pub enum ShimmifyAction {
 pub enum ShimmifyError {
     #[error("{0}")]
     IoError(#[from] std::io::Error),
-    #[error("Shim already exists! Use --force to overwrite.")]
-    ShimAlreadyExists,
+    #[error("Shim '{0}' already exists! Use --force to overwrite.")]
+    ShimAlreadyExists(String),
+    #[error("Shim '{0}' doesnt exists!")]
+    ShimDoesNotExists(String),
+    #[error("No shims configured!")]
+    NoShimsConfigured,
     #[error("{0}")]
     SerializationError(#[from] toml::ser::Error),
     #[error("{0}")]
@@ -108,34 +120,146 @@ impl ShimmifyArgs {
             .filter(|_| restart)
             .collect::<Vec<_>>();
 
-        if let ShimmifyResult::Stop =
-            config.handle(config_path, action.unwrap_or_default(), &services)?
-        {
-            exit(0);
-        }
+        config.handle(config_path, action.unwrap_or_default(), &services)?;
         Ok(())
     }
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct ShimmifyConfig {
+    #[serde(skip, default)]
+    dirty: bool,
+    #[serde(skip, default)]
+    restart_needed: bool,
     current: Option<String>,
     shims: BTreeMap<String, PathBuf>,
 }
 
-enum ShimmifyResult {
-    Continue,
-    Stop,
-}
-
 impl ShimmifyConfig {
+    fn save(&mut self, config_path: impl AsRef<Path>) -> Result<(), ShimmifyError> {
+        if self.dirty {
+            let config_str = toml::to_string_pretty(self)?;
+            std::fs::write(config_path, config_str)?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
+    fn restart(&mut self, services_to_restart: &[&str]) -> Result<(), ShimmifyError> {
+        if self.restart_needed && !services_to_restart.is_empty() {
+            return Err(Command::new("systemctl")
+                .arg("restart")
+                .args(services_to_restart)
+                .exec()
+                .into());
+        }
+        Ok(())
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn add(
+        &mut self,
+        name: &str,
+        path: impl AsRef<Path>,
+        force: bool,
+    ) -> Result<(), ShimmifyError> {
+        self.mark_dirty();
+        let old = self
+            .shims
+            .insert(name.to_string(), path.as_ref().canonicalize()?);
+        if old.is_some() && !force {
+            return Err(ShimmifyError::ShimAlreadyExists(name.to_string()));
+        }
+        println!("Added shim: {name} => {}", path.as_ref().display());
+        Ok(())
+    }
+
+    fn use_shim(&mut self, name: &str) -> Result<(), ShimmifyError> {
+        self.mark_dirty();
+        if !self.shims.contains_key(name) {
+            return Err(ShimmifyError::ShimDoesNotExists(name.to_string()));
+        }
+        println!("Active shim: {name}");
+        if self.current.as_deref() != Some(name) {
+            self.current = Some(name.to_string());
+            self.restart_needed = true;
+        }
+        Ok(())
+    }
+
+    fn remove_all(&mut self) {
+        self.mark_dirty();
+        self.shims.clear();
+        if self.current.take().is_some() {
+            self.restart_needed = true;
+        }
+        println!("Removed all shims");
+    }
+
+    fn remove(&mut self, names: &[impl AsRef<str>]) -> Result<(), ShimmifyError> {
+        self.mark_dirty();
+        for name in names {
+            let old = self.shims.remove(name.as_ref());
+            if old.is_none() {
+                return Err(ShimmifyError::ShimDoesNotExists(name.as_ref().to_string()));
+            }
+            println!("Removed shim: {}", name.as_ref());
+            if self.current.as_deref() == Some(name.as_ref()) {
+                self.current = None;
+                self.restart_needed = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.restart_needed = self.current.take().is_some();
+        println!("Reset active shim");
+        self.mark_dirty();
+    }
+
+    fn run(&mut self, args: &[impl AsRef<str>]) -> Result<(), ShimmifyError> {
+        let Some(name) = &self.current else {
+            return Ok(());
+        };
+        let Some(bin) = self.shims.get(name) else {
+            return Err(ShimmifyError::ShimDoesNotExists(name.clone()));
+        };
+        Err(std::process::Command::new(bin)
+            .envs(std::env::vars())
+            .args(args.iter().map(std::convert::AsRef::as_ref))
+            .exec()
+            .into())
+    }
+
+    fn list(&self) -> Result<(), ShimmifyError> {
+        if self.shims.is_empty() {
+            return Err(ShimmifyError::NoShimsConfigured);
+        }
+        println!("Shims:");
+        for (name, path) in &self.shims {
+            println!(
+                "- {name}{} => {}",
+                if self.current.as_deref().is_some_and(|c| c == name) {
+                    " (active)"
+                } else {
+                    ""
+                },
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     fn handle(
         &mut self,
         config_path: impl AsRef<Path>,
         action: ShimmifyAction,
         services_to_restart: &[&str],
-    ) -> Result<ShimmifyResult, ShimmifyError> {
-        let mut restart_needed = false;
+    ) -> Result<(), ShimmifyError> {
         match action {
             ShimmifyAction::Add {
                 name,
@@ -143,91 +267,22 @@ impl ShimmifyConfig {
                 use_shim,
                 force,
             } => {
-                let old = self.shims.insert(name.clone(), path.canonicalize()?);
-                if old.is_some() && !force {
-                    return Err(ShimmifyError::ShimAlreadyExists);
-                }
+                self.add(&name, &path, force)?;
                 if use_shim {
-                    return self.handle(
-                        config_path,
-                        ShimmifyAction::Use { name },
-                        services_to_restart,
-                    );
+                    self.use_shim(&name)?;
                 }
             }
-            ShimmifyAction::Remove { name } => {
-                let old = self.shims.remove(&name);
-                if old.is_none() {
-                    eprintln!("Shim does not exist!");
-                    return Ok(ShimmifyResult::Stop);
-                }
-                if self.current.as_deref() == Some(&name) {
-                    self.current = None;
-                    restart_needed = true;
-                }
-            }
-            ShimmifyAction::Use { name } => {
-                if !self.shims.contains_key(&name) {
-                    eprintln!("Shim does not exist!");
-                    return Ok(ShimmifyResult::Stop);
-                }
-                if self.current.as_ref() != Some(&name) {
-                    self.current = Some(name);
-                    restart_needed = true;
-                }
-            }
-            ShimmifyAction::Reset => {
-                self.current = None;
-                restart_needed = true;
-            }
-            ShimmifyAction::Run { args } => {
-                let bin = match &self.current {
-                    Some(name) => {
-                        let Some(path) = self.shims.get(name) else {
-                            eprintln!("Shim does not exist!");
-                            return Ok(ShimmifyResult::Stop);
-                        };
-                        path
-                    }
-                    None => return Ok(ShimmifyResult::Continue),
-                };
-                return Err(std::process::Command::new(bin)
-                    .envs(std::env::vars())
-                    .args(&args)
-                    .exec()
-                    .into());
-            }
-            ShimmifyAction::List => {
-                if self.shims.is_empty() {
-                    println!("No shims configured!");
-                } else {
-                    println!("Shims:");
-                    for (name, path) in &self.shims {
-                        println!(
-                            "- {name}{} => {}",
-                            if self.current.as_deref().is_some_and(|c| c == name) {
-                                " (active)"
-                            } else {
-                                ""
-                            },
-                            path.display()
-                        );
-                    }
-                }
-                return Ok(ShimmifyResult::Stop);
-            }
+            ShimmifyAction::Remove { all: true, .. } => self.remove_all(),
+            ShimmifyAction::Remove { names, .. } => self.remove(&names)?,
+            ShimmifyAction::Use { name } => self.use_shim(&name)?,
+            ShimmifyAction::Reset => self.reset(),
+            ShimmifyAction::Run { args } => self.run(&args)?,
+            ShimmifyAction::List => self.list()?,
         }
 
-        std::fs::write(config_path, toml::to_string_pretty(self)?)?;
+        self.save(config_path)?;
+        self.restart(services_to_restart)?;
 
-        if restart_needed && !services_to_restart.is_empty() {
-            return Err(Command::new("systemctl")
-                .arg("restart")
-                .args(services_to_restart)
-                .exec()
-                .into());
-        }
-
-        Ok(ShimmifyResult::Stop)
+        Ok(())
     }
 }

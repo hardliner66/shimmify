@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use shimmify::ShimmifyArgs;
 
 #[derive(Parser)]
 struct Cli {
@@ -10,7 +11,7 @@ struct Cli {
 enum Action {
     #[default]
     Run,
-    Shim(shimmify::ShimmifyArgs),
+    Shim(ShimmifyArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -19,6 +20,7 @@ fn main() -> anyhow::Result<()> {
         Action::Shim(shimmify) => shimmify.exec("shimmify.toml", None)?,
         Action::Run => (),
     }
+
     println!("Unshimmed!");
     Ok(())
 }
