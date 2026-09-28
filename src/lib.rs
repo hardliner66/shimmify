@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    env::VarError,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, exit},
@@ -7,7 +8,12 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use shellexpand::path::LookupError;
 use thiserror::Error;
+
+mod expanded_path;
+
+use expanded_path::ExpandedPath;
 
 #[cfg(not(target_family = "unix"))]
 compile_error!("shimmify only supports Unix-like systems");
@@ -84,6 +90,8 @@ pub enum ShimmifyError {
     ShimDoesNotExists(String),
     #[error("No shims configured!")]
     NoShimsConfigured,
+    #[error("Error looking up environment variable: {0}")]
+    LookUpError(#[from] LookupError<VarError>),
     #[error("{0}")]
     SerializationError(#[from] toml::ser::Error),
     #[error("{0}")]
@@ -106,8 +114,10 @@ impl ShimmifyArgs {
             action,
             restart,
         } = self;
-        let config_path = config_path.unwrap_or_else(|| default_config.as_ref().to_path_buf());
-        let mut config = if let Ok(config) = std::fs::read_to_string(&config_path) {
+        let config_path = ExpandedPath::new(
+            config_path.unwrap_or_else(|| default_config.as_ref().to_path_buf()),
+        )?;
+        let mut config = if let Ok(config) = std::fs::read_to_string(config_path.as_path()) {
             toml::from_str(&config)?
         } else {
             ShimmifyConfig::default()
@@ -120,7 +130,7 @@ impl ShimmifyArgs {
             .filter(|_| restart)
             .collect::<Vec<_>>();
 
-        config.handle(config_path, action.unwrap_or_default(), &services)?;
+        config.handle(&config_path, action.unwrap_or_default(), &services)?;
         Ok(())
     }
 }
@@ -136,10 +146,10 @@ struct ShimmifyConfig {
 }
 
 impl ShimmifyConfig {
-    fn save(&mut self, config_path: impl AsRef<Path>) -> Result<(), ShimmifyError> {
+    fn save(&mut self, config_path: &ExpandedPath) -> Result<(), ShimmifyError> {
         if self.dirty {
             let config_str = toml::to_string_pretty(self)?;
-            std::fs::write(config_path, config_str)?;
+            std::fs::write(config_path.as_path(), config_str)?;
             self.dirty = false;
         }
         Ok(())
@@ -160,20 +170,15 @@ impl ShimmifyConfig {
         self.dirty = true;
     }
 
-    fn add(
-        &mut self,
-        name: &str,
-        path: impl AsRef<Path>,
-        force: bool,
-    ) -> Result<(), ShimmifyError> {
+    fn add(&mut self, name: &str, path: &ExpandedPath, force: bool) -> Result<(), ShimmifyError> {
         self.mark_dirty();
         let old = self
             .shims
-            .insert(name.to_string(), path.as_ref().canonicalize()?);
+            .insert(name.to_string(), path.as_path().canonicalize()?);
         if old.is_some() && !force {
             return Err(ShimmifyError::ShimAlreadyExists(name.to_string()));
         }
-        println!("Added shim: {name} => {}", path.as_ref().display());
+        println!("Added shim: {name} => {}", path.as_path().display());
         Ok(())
     }
 
@@ -256,7 +261,7 @@ impl ShimmifyConfig {
 
     fn handle(
         &mut self,
-        config_path: impl AsRef<Path>,
+        config_path: &ExpandedPath,
         action: ShimmifyAction,
         services_to_restart: &[&str],
     ) -> Result<(), ShimmifyError> {
@@ -267,7 +272,7 @@ impl ShimmifyConfig {
                 use_shim,
                 force,
             } => {
-                self.add(&name, &path, force)?;
+                self.add(&name, &ExpandedPath::new(path)?, force)?;
                 if use_shim {
                     self.use_shim(&name)?;
                 }
