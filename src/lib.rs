@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, exit},
 };
 
 use clap::{Parser, Subcommand};
@@ -276,13 +276,13 @@ impl ShimmifyConfig {
             ShimmifyAction::Remove { names, .. } => self.remove(&names)?,
             ShimmifyAction::Use { name } => self.use_shim(&name)?,
             ShimmifyAction::Reset => self.reset(),
-            ShimmifyAction::Run { args } => self.run(&args)?,
+            ShimmifyAction::Run { args } => return self.run(&args),
             ShimmifyAction::List => self.list()?,
         }
 
         self.save(config_path)?;
         self.restart(services_to_restart)?;
 
-        Ok(())
+        exit(0);
     }
 }

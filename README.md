@@ -76,8 +76,11 @@ cargo run --example simple -- shim run -- --version
 # Deactivate the current shim
 cargo run --example simple -- shim reset
 
-# Remove a shim
-cargo run --example simple -- shim remove ls
+# Remove multiple shims
+cargo run --example simple -- shim remove ls cat
+
+# Or remove every configured shim
+cargo run --example simple -- shim remove --all
 ```
 
 The config file defaults to `shimmify.toml` in the caller's working directory.
@@ -121,3 +124,7 @@ Run the test suite and check the example with Cargo:
 cargo test
 cargo check --examples
 ```
+
+The crate only supports Unix-like systems because it uses Unix process
+replacement APIs. Restarting services additionally requires `systemctl` and
+systemd.
