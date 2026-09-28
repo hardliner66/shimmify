@@ -4,13 +4,6 @@
 without having to replace the original. It stores shim paths and the active shim in a TOML configuration file,
 and executes the shim by replacing the current process with the binary registered for the shim using `execvp`.
 
-## Features
-
-- Add, remove, list, activate, and reset named shims
-- Run the active shim with arbitrary arguments
-- Read the config path from a command-line option or `SHIMMIFY_CONFIG`
-- Optionally restart systemd services when the active shim changes
-
 ## Usage
 
 Add `shimmify` as a dependency:
@@ -63,7 +56,7 @@ cargo run --example simple -- shim add cat "$(which cat)"
 
 # Show configured shims
 cargo run --example simple -- shim list
-
+pics
 # Run the active shim, passing through arguments
 cargo run --example simple -- shim run -- -lah
 
