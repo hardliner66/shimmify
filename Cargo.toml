@@ -1,10 +1,11 @@
 [package]
 name = "shimmify"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "A library to simplify testing applications by making it possible to easily switch between different versions of binaries, without having to replace the original!"
 repository = "https://github.com/hardliner/shimmify"
 license-file = "LICENSE"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
