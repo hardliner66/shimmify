@@ -10,7 +10,7 @@ Add `shimmify` as a dependency:
 
 ```toml
 [dependencies]
-shimmify = "1.0.0"
+shimmify = "1"
 ```
 
 Expose `ShimmifyArgs` from an application command. The included example uses
