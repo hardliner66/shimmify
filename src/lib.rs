@@ -174,6 +174,9 @@ impl ShimmifyConfig {
     fn save(&mut self, config_path: &ExpandedPath) -> Result<(), ShimmifyError> {
         if self.dirty {
             let config_str = toml::to_string_pretty(self)?;
+            if let Some(parent) = config_path.as_path().parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(config_path.as_path(), config_str)?;
             self.dirty = false;
         }
