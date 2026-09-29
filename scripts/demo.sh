@@ -35,7 +35,7 @@ dbg() {
     echo "------------------ OUTPUT -----------------"
     output="$("$@")"
     if [[ "$use_tail" == true ]]; then
-        output="$(echo "$output" | tail -n +2 -)"
+        output="$(echo "$output" | tail -n +1 -)"
     elif [[ "$use_head" == true ]]; then
         output="$(echo "$output" | head -n 1)"
     fi

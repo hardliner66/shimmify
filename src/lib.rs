@@ -135,6 +135,31 @@ impl ShimmifyArgs {
     }
 }
 
+#[derive(Parser)]
+struct InternalArgs {
+    #[command(subcommand)]
+    action: Option<InternalAction>,
+}
+
+#[derive(Subcommand)]
+enum InternalAction {
+    Shim(ShimmifyArgs),
+}
+
+/// Helper function to simplify integration in binaries without cli
+pub fn shimmify(default_config: impl AsRef<Path>, services_to_restart: Option<&[&str]>) {
+    let InternalArgs {
+        action: Some(InternalAction::Shim(shimmify)),
+    } = InternalArgs::parse()
+    else {
+        return;
+    };
+    if let Err(e) = shimmify.exec(default_config, services_to_restart) {
+        eprintln!("{e}");
+        exit(1);
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct ShimmifyConfig {
     #[serde(skip, default)]
