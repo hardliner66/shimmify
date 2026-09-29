@@ -28,7 +28,7 @@ pub struct ShimmifyArgs {
     restart: bool,
     /// The action to execute (default: list)
     #[command(subcommand)]
-    action: Option<ShimmifyAction>,
+    action: ShimmifyAction,
 }
 
 #[derive(Default, Subcommand)]
@@ -130,7 +130,7 @@ impl ShimmifyArgs {
             .filter(|_| restart)
             .collect::<Vec<_>>();
 
-        config.handle(&config_path, action.unwrap_or_default(), &services)?;
+        config.handle(&config_path, action, &services)?;
         Ok(())
     }
 }
@@ -146,15 +146,26 @@ enum InternalAction {
     Shim(ShimmifyArgs),
 }
 
+impl From<InternalAction> for ShimmifyArgs {
+    fn from(value: InternalAction) -> Self {
+        let InternalAction::Shim(args) = value;
+        args
+    }
+}
+
 /// Helper function to simplify integration in binaries without cli
 pub fn shimmify(default_config: impl AsRef<Path>, services_to_restart: Option<&[&str]>) {
-    let InternalArgs {
-        action: Some(InternalAction::Shim(shimmify)),
-    } = InternalArgs::parse()
-    else {
-        return;
-    };
-    if let Err(e) = shimmify.exec(default_config, services_to_restart) {
+    let InternalArgs { action } = InternalArgs::parse();
+    let args: ShimmifyArgs = action
+        .unwrap_or_else(|| {
+            InternalAction::Shim(ShimmifyArgs {
+                config: None,
+                restart: false,
+                action: ShimmifyAction::Run { args: Vec::new() },
+            })
+        })
+        .into();
+    if let Err(e) = args.exec(default_config, services_to_restart) {
         eprintln!("{e}");
         exit(1);
     }
