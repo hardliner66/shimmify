@@ -44,6 +44,11 @@ dbg() {
     echo "==========================================="
 }
 
+rm -f "$SHIMMIFY_CONFIG"
+
+dbg "Run the unshimmed binary without a config present" \
+    simple exec
+
 dbg "Add a shim and make it active" tail \
     simple shim add ls "$(which ls)" --use
 
@@ -54,7 +59,7 @@ dbg "List all configured shims" \
     simple shim list
 
 dbg "Run the active shim" head \
-    simple shim exec -- --version
+    simple exec -- --version
 
 dbg "Switch the active shim to cat" \
     simple shim use cat
@@ -63,7 +68,7 @@ dbg "List all shims" \
     simple shim list
 
 dbg "Run the newly active shim (cat) with specific arguments" head \
-    simple shim exec -- --version
+    simple exec -- --version
 
 dbg "Deactivate the current shim" \
     simple shim reset
@@ -72,12 +77,14 @@ dbg "List all shims" \
     simple shim list
 
 dbg "Run the unshimmed binary" \
-    simple shim exec
+    simple exec
 
 dbg "Remove all shims" \
     simple shim remove --all
 
 dbg "List all shims" \
     simple shim list
+
+rm -f "$SHIMMIFY_CONFIG"
 
 popd &> /dev/null || exit 1
