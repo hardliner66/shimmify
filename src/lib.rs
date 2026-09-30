@@ -1,40 +1,59 @@
 use std::{
     collections::BTreeMap,
     env::VarError,
+    io::{stderr, stdout},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, exit},
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use serde::{Deserialize, Serialize};
 use shellexpand::path::LookupError;
+use signal_hook::{consts::SIGINT, iterator::Signals};
 use thiserror::Error;
-
-mod expanded_path;
-
-use expanded_path::ExpandedPath;
 
 #[cfg(not(target_family = "unix"))]
 compile_error!("shimmify only supports Unix-like systems");
 
-#[derive(Parser)]
-pub struct ShimmifyArgs {
-    /// The path to the shimmify config file
-    #[arg(short, long, global = true, env = "SHIMMIFY_CONFIG")]
-    config: Option<PathBuf>,
-    /// Restart the associated services when the active shim changes
-    #[arg(short, long, global = true)]
-    restart: bool,
-    /// The action to execute (default: list)
-    #[command(subcommand)]
-    action: ShimmifyAction,
+pub fn shimmify(default_config_path: impl AsRef<Path>) {
+    if std::env::var("__shimmify_run_unshimmed").is_ok_and(|v| v == "1") {
+        return;
+    }
+
+    let Args { action, config } = Args::parse();
+
+    let config = config.unwrap_or_else(|| default_config_path.as_ref().to_path_buf());
+    let Err(e) = inner(config, action) else {
+        exit(0);
+    };
+
+    eprintln!("{e}");
+    exit(1);
+}
+
+fn inner(config_path: impl AsRef<Path>, action: Action) -> Result<(), ShimmifyError> {
+    let config_path = shellexpand::path::full(&config_path)?;
+
+    match action {
+        Action::Shim { action } => handle_shim_action(config_path, action),
+        Action::Exec { args } => exec_shim(config_path, &args),
+        Action::Daemon => run_daemon(config_path),
+    }
 }
 
 #[derive(Default, Subcommand)]
-pub enum ShimmifyAction {
+enum ShimAction {
+    /// Lists all the configured shims
+    #[default]
+    #[command(aliases = ["show", "info"])]
+    List,
     /// Adds a new shim
-    #[command(aliases = ["a"])]
+    #[command(aliases = ["a", "register", "reg"])]
     Add {
         /// The name of the shim to add
         name: String,
@@ -59,29 +78,18 @@ pub enum ShimmifyAction {
         all: bool,
     },
     /// Activates a shim
-    #[command(aliases = ["u"])]
+    #[command(aliases = ["u", "activate"])]
     Use {
         /// The name of the shim to use
         name: String,
     },
     /// Deactivates the active shim
-    #[command(aliases = ["res", "unset"])]
+    #[command(aliases = ["res", "unset", "deactivate", "default"])]
     Reset,
-    /// Runs the configured shim, using execvp
-    #[command(aliases = ["r"])]
-    Run {
-        /// The arguments the shim gets passed
-        #[arg(last = true)]
-        args: Vec<String>,
-    },
-    /// Lists all the configured shims
-    #[default]
-    #[command(aliases = ["show", "info"])]
-    List,
 }
 
 #[derive(Debug, Error)]
-pub enum ShimmifyError {
+enum ShimmifyError {
     #[error("{0}")]
     IoError(#[from] std::io::Error),
     #[error("Shim '{0}' already exists! Use --force to overwrite.")]
@@ -90,6 +98,8 @@ pub enum ShimmifyError {
     ShimDoesNotExists(String),
     #[error("No shims configured!")]
     NoShimsConfigured,
+    #[error("Notify error: {0}")]
+    Notify(#[from] notify::Error),
     #[error("Error looking up environment variable: {0}")]
     LookUpError(#[from] LookupError<VarError>),
     #[error("{0}")]
@@ -98,76 +108,54 @@ pub enum ShimmifyError {
     DeserializationError(#[from] toml::de::Error),
 }
 
-impl ShimmifyArgs {
-    /// Helper function to handle shimmify args (update config, run shim, etc.)
-    ///
-    /// # Errors
-    /// Returns a `ShimmifyError` if there is an issue reading or writing the configuration file,
-    /// or if the requested action cannot be completed.
-    pub fn exec(
-        self,
-        default_config: impl AsRef<Path>,
-        services_to_restart: Option<&[&str]>,
-    ) -> Result<(), ShimmifyError> {
-        let ShimmifyArgs {
-            config: config_path,
-            action,
-            restart,
-        } = self;
-        let config_path = ExpandedPath::new(
-            config_path.unwrap_or_else(|| default_config.as_ref().to_path_buf()),
-        )?;
-        let mut config = if let Ok(config) = std::fs::read_to_string(config_path.as_path()) {
-            toml::from_str(&config)?
-        } else {
-            ShimmifyConfig::default()
-        };
-
-        let services = services_to_restart
-            .unwrap_or_default()
-            .iter()
-            .copied()
-            .filter(|_| restart)
-            .collect::<Vec<_>>();
-
-        config.handle(&config_path, action, &services)?;
-        Ok(())
-    }
-}
-
 #[derive(Parser)]
-struct InternalArgs {
+struct Args {
+    /// The path to the shimmify config file
+    #[arg(short, long, global = true, env = "SHIMMIFY_CONFIG")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
-    action: Option<InternalAction>,
+    action: Action,
 }
 
 #[derive(Subcommand)]
-enum InternalAction {
-    Shim(ShimmifyArgs),
+enum Action {
+    /// Starts the binary in daemon mode
+    ///
+    /// In this mode the binary watches if the active shim changes
+    /// and automatically restarts as the new shim
+    Daemon,
+
+    /// Executes the active shim
+    Exec {
+        /// The arguments to pass to the active shim
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Manages shims (add, remove, use, reset)
+    Shim {
+        #[command(subcommand)]
+        action: Option<ShimAction>,
+    },
 }
 
-impl From<InternalAction> for ShimmifyArgs {
-    fn from(value: InternalAction) -> Self {
-        let InternalAction::Shim(args) = value;
-        args
-    }
+fn handle_shim_action(
+    config_path: impl AsRef<Path>,
+    action: Option<ShimAction>,
+) -> Result<(), ShimmifyError> {
+    let mut config = load_config(config_path.as_ref())?;
+
+    config.handle(config_path, action)
 }
 
-/// Helper function to simplify integration in binaries without cli
-pub fn shimmify(default_config: impl AsRef<Path>, services_to_restart: Option<&[&str]>) {
-    let InternalArgs { action } = InternalArgs::parse();
-    let args: ShimmifyArgs = action
-        .unwrap_or_else(|| {
-            InternalAction::Shim(ShimmifyArgs {
-                config: None,
-                restart: false,
-                action: ShimmifyAction::Run { args: Vec::new() },
-            })
-        })
-        .into();
-    if let Err(e) = args.exec(default_config, services_to_restart) {
-        eprintln!("{e}");
-        exit(1);
+fn load_config(config_path: &Path) -> Result<ShimmifyConfig, ShimmifyError> {
+    match std::fs::read_to_string(config_path) {
+        Ok(config) => Ok(toml::from_str(&config)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ShimmifyConfig::default())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -182,27 +170,20 @@ struct ShimmifyConfig {
 }
 
 impl ShimmifyConfig {
-    fn save(&mut self, config_path: &ExpandedPath) -> Result<(), ShimmifyError> {
+    fn save(&mut self, config_path: impl AsRef<Path>) -> Result<(), ShimmifyError> {
         if self.dirty {
             let config_str = toml::to_string_pretty(self)?;
-            if let Some(parent) = config_path.as_path().parent()
+            if let Some(parent) = config_path.as_ref().parent()
                 && !parent.exists()
             {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(config_path.as_path(), config_str)?;
+            let temporary_path = config_path
+                .as_ref()
+                .with_extension(format!("tmp-{}", std::process::id()));
+            std::fs::write(&temporary_path, config_str)?;
+            std::fs::rename(temporary_path, config_path.as_ref())?;
             self.dirty = false;
-        }
-        Ok(())
-    }
-
-    fn restart(&mut self, services_to_restart: &[&str]) -> Result<(), ShimmifyError> {
-        if self.restart_needed && !services_to_restart.is_empty() {
-            return Err(Command::new("systemctl")
-                .arg("restart")
-                .args(services_to_restart)
-                .exec()
-                .into());
         }
         Ok(())
     }
@@ -211,16 +192,31 @@ impl ShimmifyConfig {
         self.dirty = true;
     }
 
-    fn add(&mut self, name: &str, path: &ExpandedPath, force: bool) -> Result<(), ShimmifyError> {
+    fn add(
+        &mut self,
+        name: &str,
+        path: impl AsRef<Path>,
+        force: bool,
+    ) -> Result<(), ShimmifyError> {
         self.mark_dirty();
-        let old = self
-            .shims
-            .insert(name.to_string(), path.as_path().canonicalize()?);
+        let old = self.shims.insert(
+            name.to_string(),
+            shellexpand::path::full(path.as_ref())?.canonicalize()?,
+        );
         if old.is_some() && !force {
             return Err(ShimmifyError::ShimAlreadyExists(name.to_string()));
         }
-        println!("Added shim: {name} => {}", path.as_path().display());
+        println!("Added shim: {name} => {}", path.as_ref().display());
         Ok(())
+    }
+
+    fn get_shim(&self) -> Result<PathBuf, ShimmifyError> {
+        if let Some(name) = &self.current
+            && let Some(bin) = self.shims.get(name)
+        {
+            return Ok(bin.clone());
+        }
+        Ok(std::env::current_exe()?)
     }
 
     fn use_shim(&mut self, name: &str) -> Result<(), ShimmifyError> {
@@ -267,20 +263,6 @@ impl ShimmifyConfig {
         self.mark_dirty();
     }
 
-    fn run(&mut self, args: &[impl AsRef<str>]) -> Result<(), ShimmifyError> {
-        let Some(name) = &self.current else {
-            return Ok(());
-        };
-        let Some(bin) = self.shims.get(name) else {
-            return Err(ShimmifyError::ShimDoesNotExists(name.clone()));
-        };
-        Err(std::process::Command::new(bin)
-            .envs(std::env::vars())
-            .args(args.iter().map(std::convert::AsRef::as_ref))
-            .exec()
-            .into())
-    }
-
     fn list(&self) -> Result<(), ShimmifyError> {
         if self.shims.is_empty() {
             return Err(ShimmifyError::NoShimsConfigured);
@@ -302,33 +284,96 @@ impl ShimmifyConfig {
 
     fn handle(
         &mut self,
-        config_path: &ExpandedPath,
-        action: ShimmifyAction,
-        services_to_restart: &[&str],
+        config_path: impl AsRef<Path>,
+        action: Option<ShimAction>,
     ) -> Result<(), ShimmifyError> {
-        match action {
-            ShimmifyAction::Add {
+        match action.unwrap_or_default() {
+            ShimAction::Add {
                 name,
                 path,
                 use_shim,
                 force,
             } => {
-                self.add(&name, &ExpandedPath::new(path)?, force)?;
+                self.add(&name, path, force)?;
                 if use_shim {
                     self.use_shim(&name)?;
                 }
             }
-            ShimmifyAction::Remove { all: true, .. } => self.remove_all(),
-            ShimmifyAction::Remove { names, .. } => self.remove(&names)?,
-            ShimmifyAction::Use { name } => self.use_shim(&name)?,
-            ShimmifyAction::Reset => self.reset(),
-            ShimmifyAction::Run { args } => return self.run(&args),
-            ShimmifyAction::List => self.list()?,
+            ShimAction::Remove { all: true, .. } => self.remove_all(),
+            ShimAction::Remove { names, .. } => self.remove(&names)?,
+            ShimAction::Use { name } => self.use_shim(&name)?,
+            ShimAction::Reset => self.reset(),
+            ShimAction::List => self.list()?,
         }
 
         self.save(config_path)?;
-        self.restart(services_to_restart)?;
 
         exit(0);
+    }
+}
+
+fn spawn_shim(shim_path: impl AsRef<Path>) -> Result<std::process::Child, std::io::Error> {
+    Command::new(shim_path.as_ref())
+        .envs(std::env::vars())
+        .env("__shimmify_run_unshimmed", "1")
+        .stdout(stdout())
+        .stderr(stderr())
+        .spawn()
+}
+
+fn exec_shim(config_path: impl AsRef<Path>, args: &[String]) -> Result<(), ShimmifyError> {
+    let config = load_config(config_path.as_ref())?;
+    let shim = config.get_shim()?;
+    Err(Command::new(shim)
+        .envs(std::env::vars())
+        .env("__shimmify_run_unshimmed", "1")
+        .args(args)
+        .exec()
+        .into())
+}
+
+fn run_daemon(config_path: impl AsRef<Path>) -> Result<(), ShimmifyError> {
+    let mut current_shim = load_config(config_path.as_ref())?.get_shim()?;
+
+    let (watcher_tx, watcher_rx) = std::sync::mpsc::channel();
+
+    let mut watcher = RecommendedWatcher::new(watcher_tx, Config::default())?;
+
+    watcher.watch(config_path.as_ref(), RecursiveMode::NonRecursive)?;
+
+    let mut signals = Signals::new([SIGINT])?;
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        for sig in signals.forever() {
+            signal_tx.send(sig).expect("failed to send signal");
+        }
+    });
+
+    let mut current = spawn_shim(&current_shim)?;
+    loop {
+        if let Ok(SIGINT) = signal_rx.recv_timeout(Duration::from_millis(500)) {
+            let _ = current.kill();
+            let _ = current.try_wait();
+            exit(0);
+        }
+        let mut need_update = false;
+        if let Ok(Ok(Event {
+            kind: EventKind::Modify(_) | EventKind::Create(_),
+            paths,
+            ..
+        })) = watcher_rx.try_recv()
+            && let Some(path) = paths.first()
+            && let Ok(new_shim) = load_config(path).and_then(|config| config.get_shim())
+            && new_shim != current_shim
+        {
+            current_shim = new_shim;
+            need_update = true;
+        }
+        if need_update {
+            let _ = current.kill();
+            let _ = current.try_wait();
+            current = spawn_shim(&current_shim)?;
+        }
     }
 }

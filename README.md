@@ -13,35 +13,17 @@ Add `shimmify` as a dependency:
 shimmify = "1"
 ```
 
-Expose `ShimmifyArgs` from an application command. The included example uses
-the following pattern:
+Call `shimmify` from your application's `main` function. It parses the
+application's command line and handles the `daemon`, `exec`, and `shim`
+commands before returning control to the application when no shim is active:
 
 ```rust
-use clap::{Parser, Subcommand};
-use shimmify::ShimmifyArgs;
+use shimmify::shimmify;
 
-#[derive(Parser)]
-struct Cli {
-    #[command(subcommand)]
-    action: Option<Action>,
-}
-
-#[derive(Default, Subcommand)]
-enum Action {
-    #[default]
-    Run,
-    Shim(ShimmifyArgs),
-}
-
-fn main() -> anyhow::Result<()> {
-    let Cli { action } = Cli::parse();
-    match action.unwrap_or_default() {
-        Action::Shim(shimmify) => shimmify.exec("shimmify.toml", None)?,
-        Action::Run => (),
-    }
+fn main() {
+    shimmify("shimmify.toml");
 
     println!("Unshimmed!");
-    Ok(())
 }
 ```
 
@@ -56,15 +38,15 @@ cargo run --example simple -- shim add cat "$(which cat)"
 
 # Show configured shims
 cargo run --example simple -- shim list
-pics
+
 # Run the active shim, passing through arguments
-cargo run --example simple -- shim run -- -lah
+cargo run --example simple -- exec -- -lah
 
 # Switch the active shim
 cargo run --example simple -- shim use cat
 
 # Run the active shim, passing through arguments
-cargo run --example simple -- shim run -- --version
+cargo run --example simple -- exec -- --version
 
 # Deactivate the current shim
 cargo run --example simple -- shim reset
@@ -92,22 +74,9 @@ nightly = "/opt/nightly/bin/tool"
 stable = "/usr/local/bin/tool"
 ```
 
-When no shim is active, `run` leaves the process unchanged. When one is
-active, `run` replaces the wrapper process with that executable and forwards
+When no shim is active, `exec` leaves the process unchanged. When one is
+active, `exec` replaces the wrapper process with that executable and forwards
 the environment and command-line arguments.
-
-## Restarting services
-
-Pass service names to `exec` and use the global `--restart` option to restart
-them when `use`, `reset`, `add --use`, or removal of the active shim changes
-the selected executable:
-
-```rust
-args.exec("shimmify.toml", Some(&["my-tool.service"]))?;
-```
-
-This invokes `systemctl restart` and therefore requires a Unix system with
-systemd available.
 
 ## Development
 

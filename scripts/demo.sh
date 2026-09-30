@@ -30,10 +30,11 @@ dbg() {
     echo ""
     echo "==========================================="
 
-    echo "$description:"
+    echo "# $description:"
     echo "> $@"
+    output="$("$@" 2>&1)"
     echo "------------------ OUTPUT -----------------"
-    output="$("$@")"
+
     if [[ "$use_tail" == true ]]; then
         output="$(echo "$output" | tail -n +1 -)"
     elif [[ "$use_head" == true ]]; then
@@ -53,7 +54,7 @@ dbg "List all configured shims" \
     simple shim list
 
 dbg "Run the active shim" head \
-    simple shim run -- --version
+    simple shim exec -- --version
 
 dbg "Switch the active shim to cat" \
     simple shim use cat
@@ -62,7 +63,7 @@ dbg "List all shims" \
     simple shim list
 
 dbg "Run the newly active shim (cat) with specific arguments" head \
-    simple shim run -- --version
+    simple shim exec -- --version
 
 dbg "Deactivate the current shim" \
     simple shim reset
@@ -71,8 +72,12 @@ dbg "List all shims" \
     simple shim list
 
 dbg "Run the unshimmed binary" \
-    simple shim run
+    simple shim exec
 
-rm "$SHIMMIFY_CONFIG" &> /dev/null
+dbg "Remove all shims" \
+    simple shim remove --all
+
+dbg "List all shims" \
+    simple shim list
 
 popd &> /dev/null || exit 1
